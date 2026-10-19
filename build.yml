@@ -1,0 +1,1081 @@
+name: Build BulletTime ASI
+
+# Self-contained: this one file generates the source + ini, compiles the .asi
+# with MSVC (x86) and uploads it as an artifact. No other files are needed in the repo.
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Generate source files
+        shell: bash
+        run: |
+          mkdir -p src dist
+          cat > src/BulletTime.cpp <<'CPP_EOF'
+          // =============================================================================
+          //  BulletTime.asi - "Dead Eye" style bullet time for GTA San Andreas (1.0 US)
+          //
+          //  * Press the activation key (default Z) to slow the world down with ease in/out
+          //  * CJ's animations are sped up so he keeps (a configurable amount of) his speed
+          //  * While aiming (right mouse) CJ is not slowed and the world briefly speeds back
+          //    up so the aim transition is never sluggish
+          //  * Post-process screen filter (saturation / contrast / tint / vignette)
+          //  * Everything lives in BulletTime.ini next to the .asi and hot-reloads
+          // =============================================================================
+          #ifndef WIN32_LEAN_AND_MEAN
+          #define WIN32_LEAN_AND_MEAN
+          #endif
+          #ifndef NOMINMAX
+          #define NOMINMAX
+          #endif
+          #include <windows.h>
+          #include <d3d9.h>
+          #include <stdio.h>
+          #include <stdlib.h>
+          #include <stdarg.h>
+          #include <string.h>
+          #include <math.h>
+
+          // ----------------------------------------------------------------------------
+          //  Game memory (GTA SA 1.0 US)
+          // ----------------------------------------------------------------------------
+          static const DWORD A_VERSION     = 0x82457C;  // WORD == 0x94BF on 1.0 US
+          static const DWORD A_DEVICE      = 0xC97C28;  // IDirect3DDevice9*
+          static const DWORD A_TIMESCALE   = 0xB7CB64;  // float CTimer::ms_fTimeScale
+          static const DWORD A_CODEPAUSE   = 0xB7CB48;  // bool  CTimer::m_CodePause
+          static const DWORD A_USERPAUSE   = 0xB7CB49;  // bool  CTimer::m_UserPause
+          static const DWORD A_MENU        = 0xBA67A4;  // bool  FrontEndMenuManager.m_bMenuActive
+          static const DWORD A_PLAYERS     = 0xB7CD98;  // CWorld::Players[]
+          static const DWORD A_PLAYERFOCUS = 0xB7CD74;  // CWorld::PlayerInFocus
+          static const DWORD A_PLAYERPED   = 0xB6F5F0;  // fallback: player ped pointer
+          static const DWORD A_CLUMPOFS    = 0xB5F878;  // RpAnimBlend clump plugin offset
+          static const int   PED_CLUMP     = 0x18;      // CEntity::m_pRwObject
+          static const int   PED_HEALTH    = 0x540;     // CPed::m_fHealth
+          static const int   PLAYERINFO_SZ = 0x190;     // sizeof(CPlayerInfo)
+
+          // ----------------------------------------------------------------------------
+          //  Small helpers
+          // ----------------------------------------------------------------------------
+          static float Clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
+          static float Lerp(float a, float b, float t)    { return a + (b - a) * t; }
+          static float Smooth01(float t)                  { t = Clamp(t, 0.f, 1.f); return t * t * (3.f - 2.f * t); }
+          static float MoveToward(float cur, float target, float step)
+          {
+              if (cur < target)      { cur += step; if (cur > target) cur = target; }
+              else if (cur > target) { cur -= step; if (cur < target) cur = target; }
+              return cur;
+          }
+
+          static HMODULE g_self;
+          static char    g_iniPath[MAX_PATH];
+          static char    g_logPath[MAX_PATH];
+          static bool    g_logEnabled = true;
+
+          static void Log(const char* fmt, ...)
+          {
+              if (!g_logEnabled) return;
+              FILE* f = fopen(g_logPath, "a");
+              if (!f) return;
+              SYSTEMTIME st; GetLocalTime(&st);
+              fprintf(f, "[%02d:%02d:%02d] ", st.wHour, st.wMinute, st.wSecond);
+              va_list ap; va_start(ap, fmt); vfprintf(f, fmt, ap); va_end(ap);
+              fputc('\n', f);
+              fclose(f);
+          }
+
+          static LARGE_INTEGER g_qpf;
+          static double NowSec()
+          {
+              LARGE_INTEGER t; QueryPerformanceCounter(&t);
+              return (double)t.QuadPart / (double)g_qpf.QuadPart;
+          }
+
+          static bool ReadWordSafe(DWORD addr, WORD* out)
+          {
+              __try { *out = *(volatile WORD*)addr; return true; }
+              __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+          }
+          static bool ReadDwordSafe(DWORD addr, DWORD* out)
+          {
+              __try { *out = *(volatile DWORD*)addr; return true; }
+              __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+          }
+
+          // ----------------------------------------------------------------------------
+          //  Easing curves
+          // ----------------------------------------------------------------------------
+          enum CurveType { C_LINEAR, C_QUAD_IN, C_QUAD_OUT, C_CUBIC_IN, C_CUBIC_OUT, C_SMOOTH, C_SMOOTHER, C_SINE, C_EXPO_OUT };
+
+          static float CurveEval(int type, float p)
+          {
+              p = Clamp(p, 0.f, 1.f);
+              switch (type)
+              {
+              case C_LINEAR:    return p;
+              case C_QUAD_IN:   return p * p;
+              case C_QUAD_OUT:  return 1.f - (1.f - p) * (1.f - p);
+              case C_CUBIC_IN:  return p * p * p;
+              case C_CUBIC_OUT: { float q = 1.f - p; return 1.f - q * q * q; }
+              case C_SMOOTH:    return p * p * (3.f - 2.f * p);
+              case C_SMOOTHER:  return p * p * p * (p * (p * 6.f - 15.f) + 10.f);
+              case C_SINE:      return 0.5f - 0.5f * cosf(3.14159265f * p);
+              case C_EXPO_OUT:  return (1.f - powf(2.f, -10.f * p)) / (1.f - powf(2.f, -10.f));
+              }
+              return p;
+          }
+
+          // Finds p such that CurveEval(type, p) == a (all curves are monotonic).
+          static float CurveInvert(int type, float a)
+          {
+              a = Clamp(a, 0.f, 1.f);
+              float lo = 0.f, hi = 1.f;
+              for (int i = 0; i < 18; ++i)
+              {
+                  float m = 0.5f * (lo + hi);
+                  if (CurveEval(type, m) < a) lo = m; else hi = m;
+              }
+              return 0.5f * (lo + hi);
+          }
+
+          // ----------------------------------------------------------------------------
+          //  Configuration (BulletTime.ini)
+          // ----------------------------------------------------------------------------
+          struct Config
+          {
+              // [General]
+              bool  enabled        = true;
+              int   key            = 'Z';
+              bool  toggle         = true;
+              float duration       = 8.0f;
+              float cooldown       = 3.0f;
+              // [Timing]
+              float easeIn         = 0.45f;
+              float easeOut        = 0.75f;
+              int   curveIn        = C_SMOOTH;
+              int   curveOut       = C_SMOOTH;
+              // [Speed]
+              float gameSpeed      = 0.25f;
+              float playerSpeed    = 0.60f;
+              bool  playerComp     = true;
+              // [Aiming]
+              int   aimKey         = VK_RBUTTON;
+              float aimTransTime   = 0.5f;
+              float aimTransSpeed  = 1.0f;
+              float aimEase        = 0.12f;
+              float aimPlayerSpeed = 1.0f;
+              // [Filter]
+              bool  filterOn       = true;
+              float filterIntensity = 1.0f;
+              float saturation     = 0.35f;
+              float contrast       = 1.12f;
+              float brightness     = 0.0f;
+              float tint[3]        = { 1.0f, 0.82f, 0.55f };
+              float tintStrength   = 0.35f;
+              float vigStrength    = 0.70f;
+              float vigRadius      = 0.45f;
+              float vigSoftness    = 0.60f;
+              float vigColor[3]    = { 0.08f, 0.04f, 0.0f };
+              // [Advanced]
+              bool  skipVersionCheck = false;
+              bool  ignoreMenuFlag   = false;
+              bool  hotReload        = true;
+              bool  logging          = true;
+          };
+
+          static Config   g_cfg;
+          static FILETIME g_iniStamp;
+          static double   g_nextIniCheck = 0.0;
+
+          static void ReadStr(const char* sec, const char* key, const char* def, char* out, int n)
+          {
+              GetPrivateProfileStringA(sec, key, def, out, n, g_iniPath);
+              char* semi = strchr(out, ';');
+              if (semi) *semi = 0;
+              int len = (int)strlen(out);
+              while (len > 0 && (out[len - 1] == ' ' || out[len - 1] == '\t' || out[len - 1] == '\r' || out[len - 1] == '\n')) out[--len] = 0;
+              char* p = out;
+              while (*p == ' ' || *p == '\t') ++p;
+              if (p != out) memmove(out, p, strlen(p) + 1);
+          }
+
+          // Locale independent float parser (accepts '.' or ',' as decimal separator)
+          static float ParseFloat(const char* s, float def)
+          {
+              while (*s == ' ' || *s == '\t') ++s;
+              bool neg = false;
+              if (*s == '-') { neg = true; ++s; } else if (*s == '+') ++s;
+              double v = 0.0; int digits = 0;
+              while (*s >= '0' && *s <= '9') { v = v * 10.0 + (*s - '0'); ++s; ++digits; }
+              if (*s == '.' || *s == ',')
+              {
+                  ++s;
+                  double scale = 0.1;
+                  while (*s >= '0' && *s <= '9') { v += (*s - '0') * scale; scale *= 0.1; ++s; ++digits; }
+              }
+              if (!digits) return def;
+              return (float)(neg ? -v : v);
+          }
+
+          static float ReadFloat(const char* sec, const char* key, float def)
+          {
+              char b[64]; ReadStr(sec, key, "", b, sizeof(b));
+              return b[0] ? ParseFloat(b, def) : def;
+          }
+
+          static bool ReadBool(const char* sec, const char* key, bool def)
+          {
+              char b[32]; ReadStr(sec, key, "", b, sizeof(b));
+              if (!b[0]) return def;
+              return !(b[0] == '0' || !_stricmp(b, "false") || !_stricmp(b, "no") || !_stricmp(b, "off"));
+          }
+
+          static void ReadColor(const char* sec, const char* key, float* rgb)
+          {
+              char b[64]; ReadStr(sec, key, "", b, sizeof(b));
+              if (!b[0]) return;
+              int r, g, bl;
+              if (sscanf(b, "%d , %d , %d", &r, &g, &bl) == 3 || sscanf(b, "%d %d %d", &r, &g, &bl) == 3)
+              {
+                  rgb[0] = Clamp(r / 255.f, 0.f, 1.f);
+                  rgb[1] = Clamp(g / 255.f, 0.f, 1.f);
+                  rgb[2] = Clamp(bl / 255.f, 0.f, 1.f);
+              }
+          }
+
+          static int ParseKey(const char* s, int def)
+          {
+              if (!s || !*s) return def;
+              if (s[1] == 0)
+              {
+                  char c = s[0];
+                  if (c >= 'a' && c <= 'z') c = (char)(c - 32);
+                  if ((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')) return c;
+              }
+              if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) return (int)strtol(s, NULL, 16);
+              bool digits = true;
+              for (const char* p = s; *p; ++p) if (*p < '0' || *p > '9') digits = false;
+              if (digits) return atoi(s);
+              if ((s[0] == 'F' || s[0] == 'f') && s[1] >= '0' && s[1] <= '9')
+              {
+                  int n = atoi(s + 1);
+                  if (n >= 1 && n <= 24) return VK_F1 + n - 1;
+              }
+              if (!_strnicmp(s, "NUMPAD", 6) && s[6] >= '0' && s[6] <= '9' && s[7] == 0) return VK_NUMPAD0 + (s[6] - '0');
+              static const struct { const char* name; int vk; } names[] = {
+                  { "LBUTTON", 0x01 }, { "LMB", 0x01 }, { "RBUTTON", 0x02 }, { "RMB", 0x02 },
+                  { "MBUTTON", 0x04 }, { "MMB", 0x04 }, { "XBUTTON1", 0x05 }, { "XBUTTON2", 0x06 },
+                  { "BACKSPACE", 0x08 }, { "TAB", 0x09 }, { "ENTER", 0x0D }, { "SHIFT", 0x10 },
+                  { "CTRL", 0x11 }, { "CONTROL", 0x11 }, { "ALT", 0x12 }, { "CAPSLOCK", 0x14 },
+                  { "SPACE", 0x20 }, { "PAGEUP", 0x21 }, { "PAGEDOWN", 0x22 }, { "END", 0x23 },
+                  { "HOME", 0x24 }, { "INSERT", 0x2D }, { "DELETE", 0x2E },
+              };
+              for (size_t i = 0; i < sizeof(names) / sizeof(names[0]); ++i)
+                  if (!_stricmp(s, names[i].name)) return names[i].vk;
+              return def;
+          }
+
+          static int ParseCurve(const char* s, int def)
+          {
+              static const struct { const char* name; int v; } t[] = {
+                  { "linear", C_LINEAR }, { "quadin", C_QUAD_IN }, { "quadout", C_QUAD_OUT },
+                  { "cubicin", C_CUBIC_IN }, { "cubicout", C_CUBIC_OUT }, { "smooth", C_SMOOTH },
+                  { "smoothstep", C_SMOOTH }, { "smoother", C_SMOOTHER }, { "smootherstep", C_SMOOTHER },
+                  { "sine", C_SINE }, { "expoout", C_EXPO_OUT },
+              };
+              for (size_t i = 0; i < sizeof(t) / sizeof(t[0]); ++i)
+                  if (!_stricmp(s, t[i].name)) return t[i].v;
+              return def;
+          }
+
+          static void LoadConfig(Config& c)
+          {
+              c = Config();
+              char b[64];
+
+              c.enabled = ReadBool("General", "Enabled", true);
+              ReadStr("General", "ActivateKey", "Z", b, sizeof(b));  c.key    = ParseKey(b, 'Z');
+              ReadStr("General", "Mode", "Toggle", b, sizeof(b));    c.toggle = _stricmp(b, "Hold") != 0;
+              c.duration = Clamp(ReadFloat("General", "Duration", c.duration), 0.f, 3600.f);
+              c.cooldown = Clamp(ReadFloat("General", "Cooldown", c.cooldown), 0.f, 3600.f);
+
+              c.easeIn  = Clamp(ReadFloat("Timing", "EaseInTime",  c.easeIn),  0.f, 30.f);
+              c.easeOut = Clamp(ReadFloat("Timing", "EaseOutTime", c.easeOut), 0.f, 30.f);
+              ReadStr("Timing", "EaseInCurve",  "Smooth", b, sizeof(b)); c.curveIn  = ParseCurve(b, C_SMOOTH);
+              ReadStr("Timing", "EaseOutCurve", "Smooth", b, sizeof(b)); c.curveOut = ParseCurve(b, C_SMOOTH);
+
+              c.gameSpeed   = Clamp(ReadFloat("Speed", "GameSpeed",   c.gameSpeed),   0.01f, 5.f);
+              c.playerSpeed = Clamp(ReadFloat("Speed", "PlayerSpeed", c.playerSpeed), 0.01f, 10.f);
+              c.playerComp  = ReadBool("Speed", "PlayerCompensation", true);
+
+              ReadStr("Aiming", "AimKey", "RBUTTON", b, sizeof(b)); c.aimKey = ParseKey(b, VK_RBUTTON);
+              c.aimTransTime   = Clamp(ReadFloat("Aiming", "AimTransitionTime",      c.aimTransTime),   0.f, 10.f);
+              c.aimTransSpeed  = Clamp(ReadFloat("Aiming", "AimTransitionGameSpeed", c.aimTransSpeed),  0.01f, 5.f);
+              c.aimEase        = Clamp(ReadFloat("Aiming", "AimEaseTime",            c.aimEase),        0.f, 5.f);
+              c.aimPlayerSpeed = Clamp(ReadFloat("Aiming", "AimPlayerSpeed",         c.aimPlayerSpeed), 0.01f, 10.f);
+
+              c.filterOn        = ReadBool("Filter", "Enabled", true);
+              c.filterIntensity = Clamp(ReadFloat("Filter", "Intensity",    c.filterIntensity), 0.f, 1.f);
+              c.saturation      = Clamp(ReadFloat("Filter", "Saturation",   c.saturation),      0.f, 3.f);
+              c.contrast        = Clamp(ReadFloat("Filter", "Contrast",     c.contrast),        0.f, 3.f);
+              c.brightness      = Clamp(ReadFloat("Filter", "Brightness",   c.brightness),     -1.f, 1.f);
+              ReadColor("Filter", "TintColor", c.tint);
+              c.tintStrength    = Clamp(ReadFloat("Filter", "TintStrength", c.tintStrength),    0.f, 1.f);
+              c.vigStrength     = Clamp(ReadFloat("Filter", "VignetteStrength", c.vigStrength), 0.f, 1.f);
+              c.vigRadius       = Clamp(ReadFloat("Filter", "VignetteRadius",   c.vigRadius),   0.f, 1.5f);
+              c.vigSoftness     = Clamp(ReadFloat("Filter", "VignetteSoftness", c.vigSoftness), 0.01f, 2.f);
+              ReadColor("Filter", "VignetteColor", c.vigColor);
+
+              c.skipVersionCheck = ReadBool("Advanced", "SkipVersionCheck", false);
+              c.ignoreMenuFlag   = ReadBool("Advanced", "IgnoreMenuFlag",   false);
+              c.hotReload        = ReadBool("Advanced", "HotReload",        true);
+              c.logging          = ReadBool("Advanced", "Log",              true);
+              g_logEnabled = c.logging;
+          }
+
+          static bool GetIniStamp(FILETIME* ft)
+          {
+              WIN32_FILE_ATTRIBUTE_DATA d;
+              if (!GetFileAttributesExA(g_iniPath, GetFileExInfoStandard, &d)) return false;
+              *ft = d.ftLastWriteTime;
+              return true;
+          }
+
+          static void MaybeReloadConfig()
+          {
+              FILETIME ft;
+              if (!GetIniStamp(&ft)) return;
+              if (CompareFileTime(&ft, &g_iniStamp) != 0)
+              {
+                  g_iniStamp = ft;
+                  LoadConfig(g_cfg);
+                  Log("BulletTime.ini reloaded");
+              }
+          }
+
+          // ----------------------------------------------------------------------------
+          //  Player animation speed compensation
+          //
+          //  The world is slowed with CTimer::ms_fTimeScale, which also slows CJ. To let CJ
+          //  keep his speed we multiply the speed of every animation playing on his clump.
+          //  The original speed of every animation is remembered so the game can keep
+          //  changing it and so everything is restored perfectly when bullet time ends.
+          // ----------------------------------------------------------------------------
+          struct AnimTrack { DWORD assoc; DWORD hier; short animId; float written; float base; };
+          static AnimTrack g_trk[128];
+          static int       g_nTrk = 0;
+          static bool      g_animBad = false;
+
+          static bool Plausible(float v, float lim) { return v == v && v > -lim && v < lim; }
+
+          static void ApplyAnimFactor(BYTE* ped, float f)
+          {
+              if (g_animBad || !ped) { g_nTrk = 0; return; }
+              __try
+              {
+                  BYTE* clump = *(BYTE**)(ped + PED_CLUMP);
+                  int   ofs   = *(int*)A_CLUMPOFS;
+                  if (!clump || ofs <= 0 || ofs > 0x800) { g_nTrk = 0; return; }
+                  BYTE* data = *(BYTE**)(clump + ofs);
+                  if (!data) { g_nTrk = 0; return; }
+
+                  DWORD h0 = *(DWORD*)data, h1 = *(DWORD*)(data + 4);
+                  if (h0 && h1) { g_animBad = true; Log("anim compensation disabled: unexpected anim list layout"); return; }
+                  DWORD cur  = h0 ? h0 : h1;
+                  DWORD from = (DWORD)data;
+
+                  const bool restore = fabsf(f - 1.f) < 0.002f;
+                  AnimTrack nt[128];
+                  int nn = 0, guard = 0;
+
+                  while (cur && guard++ < 128)
+                  {
+                      if (cur < 0x10000 || (cur & 3)) break;
+                      BYTE* a = (BYTE*)cur;
+                      float blend = *(float*)(a + 0x14);
+                      float ctime = *(float*)(a + 0x1C);
+                      float spd   = *(float*)(a + 0x20);
+                      if (!Plausible(blend, 100.f) || !Plausible(ctime, 1e5f) || !Plausible(spd, 1e4f))
+                      {
+                          g_animBad = true;
+                          Log("anim compensation disabled: implausible animation data (layout mismatch)");
+                          break;
+                      }
+                      DWORD hier   = *(DWORD*)(a + 0x10);
+                      short animId = *(short*)(a + 0x28);
+
+                      float base = spd;
+                      for (int i = 0; i < g_nTrk; ++i)
+                      {
+                          const AnimTrack& t = g_trk[i];
+                          if (t.assoc == cur && t.hier == hier && t.animId == animId)
+                          {
+                              bool untouched = fabsf(spd - t.written) <= 1e-5f + 1e-4f * fabsf(t.written);
+                              base = untouched ? t.base : spd;
+                              break;
+                          }
+                      }
+                      float target = restore ? base : base * f;
+                      if (target != spd) *(float*)(a + 0x20) = target;
+                      if (nn < 128) { nt[nn].assoc = cur; nt[nn].hier = hier; nt[nn].animId = animId; nt[nn].written = target; nt[nn].base = base; ++nn; }
+
+                      DWORD x0 = *(DWORD*)a, x1 = *(DWORD*)(a + 4), nxt = 0;
+                      if (x0 == from)      nxt = x1;
+                      else if (x1 == from) nxt = x0;
+                      else if (!x0)        nxt = x1;
+                      else if (!x1)        nxt = x0;
+                      from = cur; cur = nxt;
+                  }
+
+                  if (restore) g_nTrk = 0;
+                  else { memcpy(g_trk, nt, nn * sizeof(AnimTrack)); g_nTrk = nn; }
+              }
+              __except (EXCEPTION_EXECUTE_HANDLER)
+              {
+                  g_animBad = true; g_nTrk = 0;
+                  Log("anim compensation disabled: access violation");
+              }
+          }
+
+          // ----------------------------------------------------------------------------
+          //  Bullet time state machine
+          // ----------------------------------------------------------------------------
+          enum State { ST_IDLE, ST_IN, ST_ACTIVE, ST_OUT };
+
+          static int    g_state = ST_IDLE;
+          static float  g_p = 0.f;            // linear progress 0..1
+          static float  g_a = 0.f;            // eased amount 0..1
+          static double g_activeT = 0.0, g_cooldownEnd = 0.0, g_lastNow = 0.0, g_aimWindowEnd = 0.0;
+          static bool   g_prevKey = false, g_prevAim = false;
+          static float  g_aimLevel = 0.f, g_transLevel = 0.f;
+          static float  g_savedScale = 1.f;
+          static float  g_filterA = 0.f;      // filter strength for the renderer
+          static bool   g_suppress = false;   // true while paused / in menu
+
+          static bool GameHasFocus()
+          {
+              HWND h = GetForegroundWindow();
+              if (!h) return false;
+              DWORD pid = 0; GetWindowThreadProcessId(h, &pid);
+              return pid == GetCurrentProcessId();
+          }
+          static bool KeyDown(int vk) { return vk > 0 && (GetAsyncKeyState(vk) & 0x8000) != 0; }
+
+          static BYTE* GetPlayerPed()
+          {
+              DWORD idx = *(volatile BYTE*)A_PLAYERFOCUS;
+              if (idx > 3) idx = 0;
+              DWORD p = *(volatile DWORD*)(A_PLAYERS + idx * PLAYERINFO_SZ);
+              if (!p) p = *(volatile DWORD*)A_PLAYERPED;
+              if (p < 0x10000 || (p & 3)) return NULL;
+              return (BYTE*)p;
+          }
+
+          static void BeginIn()
+          {
+              if (g_state == ST_IDLE)
+              {
+                  float s = *(volatile float*)A_TIMESCALE;
+                  g_savedScale = (s >= 0.05f && s <= 4.f) ? s : 1.f;
+              }
+              g_state = ST_IN;
+              g_p = CurveInvert(g_cfg.curveIn, g_a);
+              g_activeT = 0.0;
+          }
+
+          static void BeginOut(double now)
+          {
+              g_state = ST_OUT;
+              g_cooldownEnd = now + g_cfg.cooldown;
+              g_p = CurveInvert(g_cfg.curveOut, g_a);
+          }
+
+          static void FinishEffect(BYTE* ped)
+          {
+              *(volatile float*)A_TIMESCALE = g_savedScale;
+              ApplyAnimFactor(ped, 1.0f);
+              g_state = ST_IDLE; g_p = 0.f; g_a = 0.f; g_filterA = 0.f;
+              g_aimLevel = 0.f; g_transLevel = 0.f;
+          }
+
+          static void FrameLogic()
+          {
+              g_suppress = false;
+              const double now = NowSec();
+              double dt = now - g_lastNow;
+              g_lastNow = now;
+              if (dt < 0.0) dt = 0.0;
+              if (dt > 0.25) dt = 0.25;
+
+              if (g_cfg.hotReload && now >= g_nextIniCheck) { g_nextIniCheck = now + 1.0; MaybeReloadConfig(); }
+              const Config& c = g_cfg;
+
+              bool paused = false;
+              if (!c.ignoreMenuFlag)
+                  paused = *(volatile BYTE*)A_MENU || *(volatile BYTE*)A_CODEPAUSE || *(volatile BYTE*)A_USERPAUSE;
+
+              const bool focus   = GameHasFocus();
+              const bool keyDown = focus && KeyDown(c.key);
+              const bool aimDown = focus && KeyDown(c.aimKey);
+
+              if (paused)
+              {
+                  g_prevKey = keyDown; g_prevAim = aimDown; g_suppress = true;
+                  return;
+              }
+
+              const bool pressed = keyDown && !g_prevKey;
+              g_prevKey = keyDown;
+              if (aimDown != g_prevAim)
+              {
+                  g_prevAim = aimDown;
+                  if (c.aimTransTime > 0.f) g_aimWindowEnd = now + c.aimTransTime;
+              }
+
+              BYTE*  ped    = GetPlayerPed();
+              float  health = ped ? *(volatile float*)(ped + PED_HEALTH) : 0.f;
+              bool   alive  = ped && health > 0.f;
+              if (!alive)
+              {
+                  if (g_state != ST_IDLE) FinishEffect(ped);
+                  g_filterA = 0.f;
+                  return;
+              }
+
+              if (!c.enabled && (g_state == ST_IN || g_state == ST_ACTIVE)) BeginOut(now);
+
+              const float inT  = c.easeIn  > 0.001f ? c.easeIn  : 0.001f;
+              const float outT = c.easeOut > 0.001f ? c.easeOut : 0.001f;
+
+              switch (g_state)
+              {
+              case ST_IDLE:
+                  if (c.enabled && pressed && now >= g_cooldownEnd) BeginIn();
+                  break;
+
+              case ST_IN:
+              case ST_ACTIVE:
+              {
+                  g_activeT += dt;
+                  bool end = c.toggle ? pressed : !keyDown;
+                  if (c.duration > 0.01f && g_activeT >= c.duration) end = true;
+                  if (end) { BeginOut(now); }
+                  else if (g_state == ST_IN)
+                  {
+                      g_p += (float)dt / inT;
+                      if (g_p >= 1.f) { g_p = 1.f; g_state = ST_ACTIVE; }
+                      g_a = CurveEval(c.curveIn, g_p);
+                  }
+                  else g_a = 1.f;
+                  break;
+              }
+
+              case ST_OUT:
+                  if (c.enabled && pressed && now >= g_cooldownEnd) { BeginIn(); }
+                  else
+                  {
+                      g_p -= (float)dt / outT;
+                      if (g_p <= 0.f) { FinishEffect(ped); return; }
+                      g_a = CurveEval(c.curveOut, g_p);
+                  }
+                  break;
+              }
+
+              if (g_state == ST_IDLE) { g_filterA = 0.f; return; }
+
+              // --- aim handling -------------------------------------------------------
+              const float aimStep = (float)dt / (c.aimEase > 0.001f ? c.aimEase : 0.001f);
+              g_aimLevel   = MoveToward(g_aimLevel,   aimDown ? 1.f : 0.f, aimStep);
+              g_transLevel = MoveToward(g_transLevel, (now < g_aimWindowEnd) ? 1.f : 0.f, aimStep);
+
+              const float a = g_a;
+
+              // world speed
+              const float scaleBase  = Lerp(1.f, c.gameSpeed, a);
+              const float scaleTrans = Lerp(1.f, c.aimTransSpeed, a);
+              float eff = Lerp(scaleBase, scaleTrans, Smooth01(g_transLevel));
+              eff = Clamp(eff, 0.01f, 10.f);
+              *(volatile float*)A_TIMESCALE = eff;
+
+              // CJ speed (relative to normal speed) -> animation speed factor
+              const float psBase = Lerp(1.f, c.playerSpeed, a);
+              const float psAim  = Lerp(1.f, c.aimPlayerSpeed, a);
+              const float ps     = Lerp(psBase, psAim, Smooth01(g_aimLevel));
+              float f = c.playerComp ? ps / eff : 1.f;
+              f = Clamp(f, 0.05f, 30.f);
+              ApplyAnimFactor(ped, f);
+
+              g_filterA = Clamp(a * c.filterIntensity, 0.f, 1.f);
+          }
+
+          // ----------------------------------------------------------------------------
+          //  Screen filter (D3D9 post-process, drawn right before Present)
+          // ----------------------------------------------------------------------------
+          struct IBlob : public IUnknown
+          {
+              virtual LPVOID STDMETHODCALLTYPE GetBufferPointer() = 0;
+              virtual SIZE_T STDMETHODCALLTYPE GetBufferSize() = 0;
+          };
+          typedef HRESULT(WINAPI* PFN_D3DCompile)(LPCVOID, SIZE_T, LPCSTR, const void*, void*, LPCSTR, LPCSTR, UINT, UINT, IBlob**, IBlob**);
+
+          static const char* kPixelShader = R"HLSL(
+          sampler2D scene : register(s0);
+          float4 c0 : register(c0);   // x=saturation y=contrast z=brightness w=vignette strength
+          float4 c1 : register(c1);   // rgb=tint color w=tint strength
+          float4 c2 : register(c2);   // rgb=vignette color w=vignette radius
+          float4 c3 : register(c3);   // x=1/vignette softness
+
+          float4 main(float2 uv : TEXCOORD0) : COLOR0
+          {
+              float3 col = tex2D(scene, uv).rgb;
+              float lum = dot(col, float3(0.299, 0.587, 0.114));
+              col = lerp(float3(lum, lum, lum), col, c0.x);
+              col = (col - 0.5) * c0.y + 0.5 + c0.z;
+              col = lerp(col, col * c1.rgb, c1.w);
+              float2 d = uv - 0.5;
+              float r = sqrt(dot(d, d)) * 1.41421356;
+              float v = saturate((r - c2.w) * c3.x);
+              v = v * v * (3.0 - 2.0 * v) * c0.w;
+              col = lerp(col, c2.rgb, v);
+              return float4(saturate(col), 1.0);
+          }
+          )HLSL";
+
+          static IDirect3DDevice9*      g_gfxDev   = NULL;
+          static IDirect3DTexture9*     g_tex      = NULL;
+          static IDirect3DSurface9*     g_texSurf  = NULL;
+          static IDirect3DPixelShader9* g_ps       = NULL;
+          static UINT                   g_texW = 0, g_texH = 0;
+          static D3DFORMAT              g_texFmt = D3DFMT_UNKNOWN;
+          static int                    g_gfxState = 0;   // 0 = untried, 1 = shader ok, -1 = use simple fallback
+          static int                    g_texFails = 0;
+
+          static void ReleaseTex()
+          {
+              if (g_texSurf) { g_texSurf->Release(); g_texSurf = NULL; }
+              if (g_tex)     { g_tex->Release();     g_tex = NULL; }
+          }
+
+          static bool CompileShader(IDirect3DDevice9* dev)
+          {
+              HMODULE h = LoadLibraryA("d3dcompiler_47.dll");
+              if (!h) h = LoadLibraryA("d3dcompiler_43.dll");
+              if (!h) { Log("filter: d3dcompiler dll not found, using simple tint fallback"); return false; }
+              PFN_D3DCompile comp = (PFN_D3DCompile)GetProcAddress(h, "D3DCompile");
+              if (!comp) { Log("filter: D3DCompile missing, using simple tint fallback"); return false; }
+
+              IBlob* code = NULL; IBlob* err = NULL;
+              HRESULT hr = comp(kPixelShader, strlen(kPixelShader), "bullettime.hlsl", NULL, NULL, "main", "ps_2_0", 0, 0, &code, &err);
+              if (FAILED(hr) || !code)
+              {
+                  Log("filter: shader compile failed (0x%08X): %s", (unsigned)hr, err ? (const char*)err->GetBufferPointer() : "?");
+                  if (err) err->Release();
+                  return false;
+              }
+              if (err) err->Release();
+              hr = dev->CreatePixelShader((const DWORD*)code->GetBufferPointer(), &g_ps);
+              code->Release();
+              if (FAILED(hr) || !g_ps) { Log("filter: CreatePixelShader failed (0x%08X)", (unsigned)hr); g_ps = NULL; return false; }
+              return true;
+          }
+
+          static bool EnsureGfx(IDirect3DDevice9* dev, const D3DSURFACE_DESC& d)
+          {
+              if (g_gfxDev != dev)
+              {
+                  g_gfxDev = dev; g_tex = NULL; g_texSurf = NULL; g_ps = NULL; g_gfxState = 0; g_texFails = 0; g_texW = 0;
+              }
+              if (g_gfxState == 0) g_gfxState = CompileShader(dev) ? 1 : -1;
+              if (g_gfxState < 0) return false;
+
+              if (!g_tex || g_texW != d.Width || g_texH != d.Height || g_texFmt != d.Format)
+              {
+                  ReleaseTex();
+                  HRESULT hr = dev->CreateTexture(d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET, d.Format, D3DPOOL_DEFAULT, &g_tex, NULL);
+                  if (FAILED(hr))
+                      hr = dev->CreateTexture(d.Width, d.Height, 1, D3DUSAGE_RENDERTARGET, D3DFMT_X8R8G8B8, D3DPOOL_DEFAULT, &g_tex, NULL);
+                  if (FAILED(hr) || !g_tex)
+                  {
+                      g_tex = NULL;
+                      Log("filter: render target texture failed (0x%08X)", (unsigned)hr);
+                      if (++g_texFails >= 3) { g_gfxState = -1; Log("filter: giving up on post-process, using simple tint fallback"); }
+                      return false;
+                  }
+                  g_tex->GetSurfaceLevel(0, &g_texSurf);
+                  g_texW = d.Width; g_texH = d.Height; g_texFmt = d.Format;
+                  Log("filter: post-process ready (%ux%u)", d.Width, d.Height);
+              }
+              return g_texSurf != NULL;
+          }
+
+          struct VertTex  { float x, y, z, rhw, u, v; };
+          struct VertDiff { float x, y, z, rhw; DWORD color; };
+
+          static void SetCommonStates(IDirect3DDevice9* dev)
+          {
+              dev->SetRenderState(D3DRS_ZENABLE, FALSE);
+              dev->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
+              dev->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
+              dev->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+              dev->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+              dev->SetRenderState(D3DRS_FOGENABLE, FALSE);
+              dev->SetRenderState(D3DRS_LIGHTING, FALSE);
+              dev->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
+              dev->SetRenderState(D3DRS_FILLMODE, D3DFILL_SOLID);
+              dev->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
+              dev->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
+              dev->SetRenderState(D3DRS_SEPARATEALPHABLENDENABLE, FALSE);
+              dev->SetVertexShader(NULL);
+          }
+
+          static void DrawFilter(IDirect3DDevice9* dev, float a)
+          {
+              if (FAILED(dev->TestCooperativeLevel())) return;
+
+              IDirect3DSurface9* bb = NULL;
+              if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
+              D3DSURFACE_DESC d; bb->GetDesc(&d);
+              const bool useShader = EnsureGfx(dev, d);
+
+              IDirect3DSurface9* oldRT = NULL;
+              dev->GetRenderTarget(0, &oldRT);
+
+              IDirect3DStateBlock9* sb = NULL;
+              if (SUCCEEDED(dev->CreateStateBlock(D3DSBT_ALL, &sb)) && sb)
+              {
+                  if (SUCCEEDED(dev->BeginScene()))
+                  {
+                      if (oldRT != bb) dev->SetRenderTarget(0, bb);
+                      D3DVIEWPORT9 vp = { 0, 0, d.Width, d.Height, 0.f, 1.f };
+                      dev->SetViewport(&vp);
+                      SetCommonStates(dev);
+
+                      const Config& c = g_cfg;
+                      const float w = (float)d.Width, h = (float)d.Height;
+                      bool done = false;
+
+                      if (useShader && SUCCEEDED(dev->StretchRect(bb, NULL, g_texSurf, NULL, D3DTEXF_NONE)))
+                      {
+                          float k[16];
+                          k[0]  = Lerp(1.f, c.saturation, a);
+                          k[1]  = Lerp(1.f, c.contrast, a);
+                          k[2]  = c.brightness * a;
+                          k[3]  = c.vigStrength * a;
+                          k[4]  = c.tint[0]; k[5] = c.tint[1]; k[6] = c.tint[2];
+                          k[7]  = c.tintStrength * a;
+                          k[8]  = c.vigColor[0]; k[9] = c.vigColor[1]; k[10] = c.vigColor[2];
+                          k[11] = c.vigRadius;
+                          k[12] = 1.f / (c.vigSoftness > 0.01f ? c.vigSoftness : 0.01f);
+                          k[13] = k[14] = k[15] = 0.f;
+
+                          dev->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
+                          dev->SetPixelShader(g_ps);
+                          dev->SetPixelShaderConstantF(0, k, 4);
+                          dev->SetTexture(0, g_tex);
+                          dev->SetSamplerState(0, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+                          dev->SetSamplerState(0, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+                          dev->SetSamplerState(0, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+                          dev->SetSamplerState(0, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+                          dev->SetSamplerState(0, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+                          dev->SetSamplerState(0, D3DSAMP_SRGBTEXTURE, FALSE);
+                          dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
+
+                          const VertTex q[4] = {
+                              { -0.5f,  -0.5f,  0.f, 1.f, 0.f, 0.f },
+                              { w - 0.5f, -0.5f,  0.f, 1.f, 1.f, 0.f },
+                              { -0.5f,  h - 0.5f, 0.f, 1.f, 0.f, 1.f },
+                              { w - 0.5f, h - 0.5f, 0.f, 1.f, 1.f, 1.f },
+                          };
+                          done = SUCCEEDED(dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(VertTex)));
+                      }
+
+                      if (!done)
+                      {
+                          // simple fallback: flat translucent tint
+                          const float al = Clamp(a * (c.tintStrength + 0.25f * c.vigStrength), 0.f, 0.85f);
+                          const DWORD col = D3DCOLOR_ARGB((int)(al * 255.f), (int)(c.tint[0] * 255.f), (int)(c.tint[1] * 255.f), (int)(c.tint[2] * 255.f));
+                          dev->SetPixelShader(NULL);
+                          dev->SetTexture(0, NULL);
+                          dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+                          dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+                          dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+                          dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+                          dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+                          dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+                          dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+                          dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+                          dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+                          dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+                          dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+                          const VertDiff q[4] = {
+                              { -0.5f,  -0.5f,  0.f, 1.f, col },
+                              { w - 0.5f, -0.5f,  0.f, 1.f, col },
+                              { -0.5f,  h - 0.5f, 0.f, 1.f, col },
+                              { w - 0.5f, h - 0.5f, 0.f, 1.f, col },
+                          };
+                          dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(VertDiff));
+                      }
+                      dev->EndScene();
+                  }
+                  sb->Apply();
+                  sb->Release();
+              }
+
+              if (oldRT)
+              {
+                  if (oldRT != bb) dev->SetRenderTarget(0, oldRT);
+                  oldRT->Release();
+              }
+              bb->Release();
+          }
+
+          // ----------------------------------------------------------------------------
+          //  D3D9 hooks (vtable patches: Reset = 16, Present = 17)
+          // ----------------------------------------------------------------------------
+          typedef HRESULT(STDMETHODCALLTYPE* Present_t)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
+          typedef HRESULT(STDMETHODCALLTYPE* Reset_t)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
+          static Present_t g_origPresent = NULL;
+          static Reset_t   g_origReset   = NULL;
+          static volatile LONG g_presentCalls = 0;
+          static volatile LONG g_faults = 0;
+          static volatile bool g_dead = false;
+
+          static void EmergencyRestore()
+          {
+              __try { *(volatile float*)A_TIMESCALE = g_savedScale; }
+              __except (EXCEPTION_EXECUTE_HANDLER) {}
+          }
+
+          static void SafeFrame(IDirect3DDevice9* dev)
+          {
+              __try
+              {
+                  FrameLogic();
+                  if (g_filterA > 0.003f && g_cfg.filterOn && !g_suppress) DrawFilter(dev, g_filterA);
+              }
+              __except (EXCEPTION_EXECUTE_HANDLER)
+              {
+                  LONG n = InterlockedIncrement(&g_faults);
+                  Log("exception in frame update (#%ld)", n);
+                  if (n >= 5)
+                  {
+                      g_dead = true;
+                      EmergencyRestore();
+                      Log("too many exceptions - BulletTime disabled for this session");
+                  }
+              }
+          }
+
+          static HRESULT STDMETHODCALLTYPE hkPresent(IDirect3DDevice9* dev, const RECT* src, const RECT* dst, HWND wnd, const RGNDATA* dirty)
+          {
+              InterlockedIncrement(&g_presentCalls);
+              if (!g_dead) SafeFrame(dev);
+              return g_origPresent(dev, src, dst, wnd, dirty);
+          }
+
+          static HRESULT STDMETHODCALLTYPE hkReset(IDirect3DDevice9* dev, D3DPRESENT_PARAMETERS* pp)
+          {
+              ReleaseTex();   // default-pool resources must be released before Reset
+              return g_origReset(dev, pp);
+          }
+
+          static bool PatchVtable(void** vtbl, int index, void* hook, void** orig)
+          {
+              DWORD old = 0;
+              if (!VirtualProtect(&vtbl[index], sizeof(void*), PAGE_READWRITE, &old)) return false;
+              if (vtbl[index] != hook) { *orig = vtbl[index]; vtbl[index] = hook; }
+              VirtualProtect(&vtbl[index], sizeof(void*), old, &old);
+              return *orig != NULL;
+          }
+
+          static bool InstallHooks(IDirect3DDevice9* dev)
+          {
+              __try
+              {
+                  void** vtbl = *(void***)dev;
+                  if (!PatchVtable(vtbl, 16, (void*)hkReset,   (void**)&g_origReset))   return false;
+                  if (!PatchVtable(vtbl, 17, (void*)hkPresent, (void**)&g_origPresent)) return false;
+                  return true;
+              }
+              __except (EXCEPTION_EXECUTE_HANDLER) { return false; }
+          }
+
+          static DWORD WINAPI InitThread(LPVOID)
+          {
+              QueryPerformanceFrequency(&g_qpf);
+              g_lastNow = NowSec();
+              LoadConfig(g_cfg);
+              GetIniStamp(&g_iniStamp);
+              Log("---- BulletTime loaded ----");
+
+              WORD marker = 0;
+              bool ok = ReadWordSafe(A_VERSION, &marker);
+              if (!ok || marker != 0x94BF)
+              {
+                  if (!g_cfg.skipVersionCheck)
+                  {
+                      Log("Unsupported game version (marker=0x%04X). This build only supports GTA SA 1.0 US. Set SkipVersionCheck=1 in the ini to force it.", (unsigned)marker);
+                      return 0;
+                  }
+                  Log("Version check skipped (marker=0x%04X)", (unsigned)marker);
+              }
+              else Log("GTA SA 1.0 US detected");
+
+              // wait for the game to create its Direct3D device
+              IDirect3DDevice9* dev = NULL;
+              for (;;)
+              {
+                  Sleep(250);
+                  DWORD p = 0;
+                  if (ReadDwordSafe(A_DEVICE, &p) && p > 0x10000) { dev = (IDirect3DDevice9*)p; break; }
+              }
+
+              if (!InstallHooks(dev)) { Log("Failed to hook the D3D9 device"); return 0; }
+              Log("D3D9 hooks installed (device %p)", (void*)dev);
+
+              Sleep(15000);
+              if (g_presentCalls == 0) Log("WARNING: Present hook has not been called - the mod cannot run in this setup");
+              else Log("running (%ld frames so far)", (long)g_presentCalls);
+              return 0;
+          }
+
+          BOOL APIENTRY DllMain(HMODULE h, DWORD reason, LPVOID)
+          {
+              if (reason == DLL_PROCESS_ATTACH)
+              {
+                  g_self = h;
+                  DisableThreadLibraryCalls(h);
+                  char path[MAX_PATH] = { 0 };
+                  GetModuleFileNameA(h, path, MAX_PATH);
+                  strcpy(g_iniPath, path);
+                  strcpy(g_logPath, path);
+                  char* dot = strrchr(g_iniPath, '.'); if (dot) strcpy(dot, ".ini");
+                  dot = strrchr(g_logPath, '.');       if (dot) strcpy(dot, ".log");
+                  HANDLE t = CreateThread(NULL, 0, InitThread, NULL, 0, NULL);
+                  if (t) CloseHandle(t);
+              }
+              return TRUE;
+          }
+          CPP_EOF
+          cat > dist/BulletTime.ini <<'INI_EOF'
+          ; =============================================================================
+          ;  BulletTime.ini  -  "Dead Eye" style bullet time for GTA San Andreas (1.0 US)
+          ;
+          ;  Keep this file next to BulletTime.asi. You can edit it while the game is
+          ;  running - changes are picked up automatically (about once per second).
+          ;  Put comments on their own line (a ';' at the start of the line).
+          ;  All times are in REAL seconds (not affected by the slow-motion itself).
+          ; =============================================================================
+
+          [General]
+          Enabled=1
+          ; Letter/digit, F1-F24, LBUTTON RBUTTON MBUTTON XBUTTON1 XBUTTON2, SHIFT CTRL ALT,
+          ; SPACE TAB ENTER CAPSLOCK, NUMPAD0-9, or a virtual-key code like 0x5A
+          ActivateKey=Z
+          ; Toggle = press to start, press again to stop
+          ; Hold   = active only while the key is held down
+          Mode=Toggle
+          ; How long bullet time lasts before it ends on its own (includes the ease-in).
+          ; 0 = unlimited
+          Duration=8.0
+          ; Delay after it ends before it can be triggered again. 0 = none
+          Cooldown=3.0
+
+          [Timing]
+          ; Seconds to blend into / out of bullet time. 0 = instant
+          EaseInTime=0.45
+          EaseOutTime=0.75
+          ; Curve shape: Linear, QuadIn, QuadOut, CubicIn, CubicOut, Smooth, Smoother, Sine, ExpoOut
+          ;   *Out curves drop fast then settle (punchy), *In curves start slow then drop fast
+          EaseInCurve=Smooth
+          EaseOutCurve=Smooth
+
+          [Speed]
+          ; World speed while bullet time is fully on (1.0 = normal, 0.25 = quarter speed)
+          GameSpeed=0.25
+          ; CJ's speed relative to NORMAL speed (1.0 = CJ is not slowed at all,
+          ; 0.6 = 60% of normal, same as GameSpeed = CJ is slowed like everything else)
+          PlayerSpeed=0.60
+          ; 0 = don't touch CJ's animations at all (CJ is slowed like the rest of the world)
+          PlayerCompensation=1
+
+          [Aiming]
+          ; Key used to aim (right mouse by default). Change it if you remapped aiming in-game.
+          AimKey=RBUTTON
+          ; When you press OR release the aim key, the world is allowed to run at
+          ; AimTransitionGameSpeed for this many seconds so the camera / aim transition
+          ; is never sluggish. Set to 0 to disable that and keep the world slowed.
+          AimTransitionTime=0.5
+          ; World speed during that window (1.0 = full normal speed)
+          AimTransitionGameSpeed=1.0
+          ; Seconds used to blend in/out of the aim behaviour
+          AimEaseTime=0.12
+          ; CJ's speed relative to normal while the aim key is held (1.0 = full speed)
+          AimPlayerSpeed=1.0
+
+          [Filter]
+          Enabled=1
+          ; Overall strength of the filter (0 - 1)
+          Intensity=1.0
+          ; 1.0 = unchanged, 0.0 = black & white
+          Saturation=0.35
+          Contrast=1.12
+          ; -1.0 .. 1.0, 0 = unchanged
+          Brightness=0.0
+          ; Colour multiplied over the image (R,G,B 0-255) and how much of it is applied (0 - 1)
+          TintColor=255,210,140
+          TintStrength=0.35
+          ; Dark edges. Strength 0-1, Radius = where it starts (0 = centre, ~1.4 = corners),
+          ; Softness = how wide the fade is
+          VignetteStrength=0.70
+          VignetteRadius=0.45
+          VignetteSoftness=0.60
+          VignetteColor=20,10,0
+
+          [Advanced]
+          ; Set to 1 only if the log says your game version is unsupported but you are sure
+          ; it is 1.0 US (this is a pure memory-address mod: other versions WILL crash)
+          SkipVersionCheck=0
+          ; Set to 1 if the mod never activates and the log shows a "menu/pause" problem
+          IgnoreMenuFlag=0
+          HotReload=1
+          ; Writes BulletTime.log next to the .asi
+          Log=1
+          INI_EOF
+
+      - name: Setup MSVC (x86)
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x86
+
+      - name: Compile BulletTime.asi
+        shell: cmd
+        run: cl /nologo /LD /O2 /MT /EHsc /W3 /std:c++17 /D_CRT_SECURE_NO_WARNINGS src\BulletTime.cpp /Fe:dist\BulletTime.asi /link user32.lib kernel32.lib
+
+      - name: Show build output
+        shell: bash
+        run: ls -la dist
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: BulletTime
+          path: |
+            dist/BulletTime.asi
+            dist/BulletTime.ini
+          if-no-files-found: error
+
+      - name: Publish release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/BulletTime.asi
+            dist/BulletTime.ini
