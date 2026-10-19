@@ -940,9 +940,11 @@ jobs:
               if (!InstallHooks(dev)) { Log("Failed to hook the D3D9 device"); return 0; }
               Log("D3D9 hooks installed (device %p)", (void*)dev);
 
-              Sleep(15000);
-              if (g_presentCalls == 0) Log("WARNING: Present hook has not been called - the mod cannot run in this setup");
-              else Log("running (%ld frames so far)", (long)g_presentCalls);
+              // Watchdog: the game may sit on logos / intro movies / loading screens for a while,
+              // so wait for the first presented frame and only complain after 2 minutes of nothing.
+              for (int i = 0; i < 480 && g_presentCalls == 0; ++i) Sleep(250);
+              if (g_presentCalls == 0) Log("WARNING: no frame was presented within 2 minutes - the Present hook may not be working in this setup");
+              else Log("Present hook active - first frame reached");
               return 0;
           }
 
