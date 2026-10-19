@@ -25,8 +25,9 @@ jobs:
           //
           //  * Press the activation key (default Z) to slow the world down with ease in/out
           //  * CJ's animations are sped up so he keeps (a configurable amount of) his speed
-          //  * While aiming (right mouse) CJ is not slowed and the world briefly speeds back
-          //    up so the aim transition is never sluggish
+          //  * While aiming (right mouse) CJ keeps full speed (AimPlayerSpeed) and the camera
+          //    runs in real time, so the aim transition is never sluggish while NPCs stay slow
+          //    (the camera update is wrapped with a compensated time step)
           //  * Post-process screen filter (saturation / contrast / tint / vignette)
           //  * Everything lives in BulletTime.ini next to the .asi and hot-reloads
           // =============================================================================
@@ -57,6 +58,10 @@ jobs:
           static const DWORD A_PLAYERFOCUS = 0xB7CD74;  // CWorld::PlayerInFocus
           static const DWORD A_PLAYERPED   = 0xB6F5F0;  // fallback: player ped pointer
           static const DWORD A_CLUMPOFS    = 0xB5F878;  // RpAnimBlend clump plugin offset
+          static const DWORD A_TIMESTEP    = 0xB7CB5C;  // float CTimer::ms_fTimeStep
+          static const DWORD A_TIMESTEP_NC = 0xB7CB58;  // float CTimer::ms_fTimeStepNonClipped
+          static const DWORD F_CAM_PROCESS = 0x52B730;  // void __thiscall CCamera::Process()
+          static const DWORD F_UPDATE_ANIMS= 0x4D34F0;  // void __cdecl RpAnimBlendClumpUpdateAnimations(RpClump*, float step, bool)
           static const int   PED_CLUMP     = 0x18;      // CEntity::m_pRwObject
           static const int   PED_HEALTH    = 0x540;     // CPed::m_fHealth
           static const int   PLAYERINFO_SZ = 0x190;     // sizeof(CPlayerInfo)
@@ -165,12 +170,17 @@ jobs:
               float gameSpeed      = 0.25f;
               float playerSpeed    = 0.60f;
               bool  playerComp     = true;
+              int   playerMethod   = 0;   // 0 = Auto, 1 = Speed (animation speeds), 2 = Step (hook)
               // [Aiming]
               int   aimKey         = VK_RBUTTON;
-              float aimTransTime   = 0.5f;
+              float aimTransTime   = 0.0f;
               float aimTransSpeed  = 1.0f;
               float aimEase        = 0.12f;
               float aimPlayerSpeed = 1.0f;
+              // [Camera]
+              bool  cameraHook     = true;
+              float cameraSpeed    = 1.0f;
+              float aimCameraSpeed = 1.0f;
               // [Filter]
               bool  filterOn       = true;
               float filterIntensity = 1.0f;
@@ -186,6 +196,7 @@ jobs:
               // [Advanced]
               bool  skipVersionCheck = false;
               bool  ignoreMenuFlag   = false;
+              bool  callHooks        = true;
               bool  hotReload        = true;
               bool  logging          = true;
           };
@@ -314,12 +325,18 @@ jobs:
               c.gameSpeed   = Clamp(ReadFloat("Speed", "GameSpeed",   c.gameSpeed),   0.01f, 5.f);
               c.playerSpeed = Clamp(ReadFloat("Speed", "PlayerSpeed", c.playerSpeed), 0.01f, 10.f);
               c.playerComp  = ReadBool("Speed", "PlayerCompensation", true);
+              ReadStr("Speed", "PlayerMethod", "Auto", b, sizeof(b));
+              c.playerMethod = !_stricmp(b, "Speed") ? 1 : (!_stricmp(b, "Step") ? 2 : 0);
 
               ReadStr("Aiming", "AimKey", "RBUTTON", b, sizeof(b)); c.aimKey = ParseKey(b, VK_RBUTTON);
               c.aimTransTime   = Clamp(ReadFloat("Aiming", "AimTransitionTime",      c.aimTransTime),   0.f, 10.f);
               c.aimTransSpeed  = Clamp(ReadFloat("Aiming", "AimTransitionGameSpeed", c.aimTransSpeed),  0.01f, 5.f);
               c.aimEase        = Clamp(ReadFloat("Aiming", "AimEaseTime",            c.aimEase),        0.f, 5.f);
               c.aimPlayerSpeed = Clamp(ReadFloat("Aiming", "AimPlayerSpeed",         c.aimPlayerSpeed), 0.01f, 10.f);
+
+              c.cameraHook     = ReadBool("Camera", "Enabled", true);
+              c.cameraSpeed    = Clamp(ReadFloat("Camera", "CameraSpeed",    c.cameraSpeed),    0.01f, 10.f);
+              c.aimCameraSpeed = Clamp(ReadFloat("Camera", "AimCameraSpeed", c.aimCameraSpeed), 0.01f, 10.f);
 
               c.filterOn        = ReadBool("Filter", "Enabled", true);
               c.filterIntensity = Clamp(ReadFloat("Filter", "Intensity",    c.filterIntensity), 0.f, 1.f);
@@ -335,6 +352,7 @@ jobs:
 
               c.skipVersionCheck = ReadBool("Advanced", "SkipVersionCheck", false);
               c.ignoreMenuFlag   = ReadBool("Advanced", "IgnoreMenuFlag",   false);
+              c.callHooks        = ReadBool("Advanced", "CallHooks",        true);
               c.hotReload        = ReadBool("Advanced", "HotReload",        true);
               c.logging          = ReadBool("Advanced", "Log",              true);
               g_logEnabled = c.logging;
@@ -445,6 +463,120 @@ jobs:
           }
 
           // ----------------------------------------------------------------------------
+          //  Call-site hooks
+          //
+          //  Instead of detouring game functions we find every "call <function>" in the game's
+          //  code and point it at a small wrapper. The original function is never modified.
+          //    * CCamera::Process      -> runs with a compensated time step (real-time camera)
+          //    * RpAnimBlendClumpUpdateAnimations -> optionally scales CJ's animation step
+          //  The patching is done from inside the render hook, i.e. on the game's own thread,
+          //  so the game can never be executing the instruction being patched.
+          // ----------------------------------------------------------------------------
+          typedef void(__thiscall* CamProcess_t)(void*);
+          typedef void(__cdecl*    UpdateAnims_t)(void*, float, DWORD);
+          static CamProcess_t  g_origCam   = (CamProcess_t)F_CAM_PROCESS;
+          static UpdateAnims_t g_origAnims = (UpdateAnims_t)F_UPDATE_ANIMS;
+
+          static float g_camFactor  = 1.f;     // time step multiplier for the camera update
+          static float g_stepFactor = 1.f;     // time step multiplier for CJ's animation update
+          static void* g_playerClump = NULL;
+          static bool  g_camHookUsed = false, g_stepHookUsed = false;
+          static int   g_camHookCount = 0, g_animHookCount = 0;
+
+          static void __fastcall hkCamProcess(void* self, void* /*edx*/)
+          {
+              const float f = g_camFactor;
+              if (f != 1.f)
+              {
+                  volatile float* pStep = (volatile float*)A_TIMESTEP;
+                  volatile float* pRaw  = (volatile float*)A_TIMESTEP_NC;
+                  const float s = *pStep, r = *pRaw;
+                  float ns = s * f;
+                  const float cap = s > 3.f ? s : 3.f;   // the game never uses a step above 3
+                  if (ns > cap) ns = cap;
+                  *pStep = ns; *pRaw = r * f;
+                  g_camHookUsed = true;
+                  g_origCam(self);
+                  *pStep = s; *pRaw = r;
+              }
+              else g_origCam(self);
+          }
+
+          static void __cdecl hkUpdateAnims(void* clump, float step, DWORD onScreen)
+          {
+              if (clump && clump == g_playerClump && g_stepFactor != 1.f)
+              {
+                  step *= g_stepFactor;
+                  g_stepHookUsed = true;
+              }
+              g_origAnims(clump, step, onScreen);
+          }
+
+          // Collects the addresses of all "E8 rel32" instructions in [begin,end) that call 'target'.
+          static int ScanSection(BYTE* begin, BYTE* end, DWORD target, BYTE** out, int cap)
+          {
+              int n = 0;
+              __try
+              {
+                  for (BYTE* p = begin; p + 5 <= end; ++p)
+                  {
+                      if (*p != 0xE8) continue;
+                      DWORD dest = (DWORD)p + 5 + *(DWORD*)(p + 1);
+                      if (dest == target && n < cap) out[n++] = p;
+                  }
+              }
+              __except (EXCEPTION_EXECUTE_HANDLER) {}
+              return n;
+          }
+
+          static bool PatchCall(BYTE* callAddr, void* hook)
+          {
+              DWORD old = 0;
+              if (!VirtualProtect(callAddr + 1, 4, PAGE_EXECUTE_READWRITE, &old)) return false;
+              *(int*)(callAddr + 1) = (int)((DWORD)hook - ((DWORD)callAddr + 5));
+              VirtualProtect(callAddr + 1, 4, old, &old);
+              FlushInstructionCache(GetCurrentProcess(), callAddr, 5);
+              return true;
+          }
+
+          static int HookCallSites(DWORD target, void* hook, int maxExpected, const char* name)
+          {
+              BYTE* found[16];
+              int nFound = 0;
+              __try
+              {
+                  BYTE* base = (BYTE*)GetModuleHandleA(NULL);
+                  const IMAGE_DOS_HEADER* dos = (const IMAGE_DOS_HEADER*)base;
+                  const IMAGE_NT_HEADERS* nt  = (const IMAGE_NT_HEADERS*)(base + dos->e_lfanew);
+                  const IMAGE_SECTION_HEADER* sec = IMAGE_FIRST_SECTION(nt);
+                  for (int i = 0; i < (int)nt->FileHeader.NumberOfSections && nFound < 16; ++i)
+                  {
+                      if (!(sec[i].Characteristics & IMAGE_SCN_MEM_EXECUTE)) continue;
+                      DWORD size = sec[i].Misc.VirtualSize ? sec[i].Misc.VirtualSize : sec[i].SizeOfRawData;
+                      BYTE* b = base + sec[i].VirtualAddress;
+                      nFound += ScanSection(b, b + size, target, found + nFound, 16 - nFound);
+                  }
+              }
+              __except (EXCEPTION_EXECUTE_HANDLER) { Log("%s: could not read the exe headers", name); return 0; }
+
+              Log("%s: found %d call site(s) of 0x%X", name, nFound, (unsigned)target);
+              if (nFound == 0) return 0;
+              if (nFound > maxExpected) { Log("%s: more call sites than expected (max %d), not hooking", name, maxExpected); return 0; }
+
+              int patched = 0;
+              for (int i = 0; i < nFound; ++i)
+                  if (PatchCall(found[i], hook)) { ++patched; Log("  hooked call at 0x%08X", (unsigned)(DWORD)found[i]); }
+              return patched;
+          }
+
+          static void InstallCallHooks()
+          {
+              if (!g_cfg.callHooks) { Log("call hooks disabled in the ini (CallHooks=0)"); return; }
+              g_camHookCount  = HookCallSites(F_CAM_PROCESS,   (void*)hkCamProcess,  4,  "CCamera::Process");
+              g_animHookCount = HookCallSites(F_UPDATE_ANIMS,  (void*)hkUpdateAnims, 12, "RpAnimBlendClumpUpdateAnimations");
+          }
+
+          // ----------------------------------------------------------------------------
           //  Bullet time state machine
           // ----------------------------------------------------------------------------
           enum State { ST_IDLE, ST_IN, ST_ACTIVE, ST_OUT };
@@ -503,6 +635,7 @@ jobs:
               ApplyAnimFactor(ped, 1.0f);
               g_state = ST_IDLE; g_p = 0.f; g_a = 0.f; g_filterA = 0.f;
               g_aimLevel = 0.f; g_transLevel = 0.f;
+              g_camFactor = 1.f; g_stepFactor = 1.f;
           }
 
           static void FrameLogic()
@@ -528,6 +661,7 @@ jobs:
               if (paused)
               {
                   g_prevKey = keyDown; g_prevAim = aimDown; g_suppress = true;
+                  g_camFactor = 1.f; g_stepFactor = 1.f;
                   return;
               }
 
@@ -610,7 +744,22 @@ jobs:
               const float ps     = Lerp(psBase, psAim, Smooth01(g_aimLevel));
               float f = c.playerComp ? ps / eff : 1.f;
               f = Clamp(f, 0.05f, 30.f);
-              ApplyAnimFactor(ped, f);
+
+              // Auto = patch the animation speeds, and fall back to the step hook if that layout check fails
+              const bool useStep = (c.playerMethod == 2) || (c.playerMethod == 0 && g_animBad && g_animHookCount > 0);
+              g_playerClump = *(void* volatile*)(ped + PED_CLUMP);
+              if (useStep) { g_stepFactor = f; if (g_nTrk) ApplyAnimFactor(ped, 1.f); }
+              else         { g_stepFactor = 1.f; if (c.playerMethod != 2) ApplyAnimFactor(ped, f); }
+
+              // camera (real time by default, so the aim swing is never slowed)
+              const float csBase = Lerp(1.f, c.cameraSpeed, a);
+              const float csAim  = Lerp(1.f, c.aimCameraSpeed, a);
+              const float cs     = Lerp(csBase, csAim, Smooth01(g_aimLevel));
+              g_camFactor = (c.cameraHook && g_camHookCount > 0) ? Clamp(cs / eff, 0.05f, 30.f) : 1.f;
+
+              static bool loggedCam = false, loggedStep = false;
+              if (g_camHookUsed && !loggedCam)   { loggedCam = true;  Log("camera hook is active (camera time step compensated, factor %.2f)", g_camFactor); }
+              if (g_stepHookUsed && !loggedStep) { loggedStep = true; Log("player animation step hook is active (factor %.2f)", g_stepFactor); }
 
               g_filterA = Clamp(a * c.filterIntensity, 0.f, 1.f);
           }
@@ -853,10 +1002,13 @@ jobs:
               __except (EXCEPTION_EXECUTE_HANDLER) {}
           }
 
+          static bool g_hooksTried = false;
+
           static void SafeFrame(IDirect3DDevice9* dev)
           {
               __try
               {
+                  if (!g_hooksTried) { g_hooksTried = true; InstallCallHooks(); }
                   FrameLogic();
                   if (g_filterA > 0.003f && g_cfg.filterOn && !g_suppress) DrawFilter(dev, g_filterA);
               }
@@ -1007,14 +1159,33 @@ jobs:
           PlayerSpeed=0.60
           ; 0 = don't touch CJ's animations at all (CJ is slowed like the rest of the world)
           PlayerCompensation=1
+          ; How CJ's speed is applied:
+          ;   Auto  = rewrite his animation speeds; if that layout check fails, use the step hook
+          ;   Speed = always rewrite animation speeds
+          ;   Step  = always scale his animation time step through the call hook
+          ; If CJ is NOT keeping his speed in bullet time, try Step (see BulletTime.log).
+          PlayerMethod=Auto
+
+          [Camera]
+          ; The camera update is run with a compensated time step so the camera (and the aim
+          ; swing) is NOT slowed down while NPCs and the world stay slow.
+          Enabled=1
+          ; Camera speed relative to NORMAL during bullet time (1.0 = camera never slowed,
+          ; same as GameSpeed = camera slowed like the world)
+          CameraSpeed=1.0
+          ; Same, while the aim key is held
+          AimCameraSpeed=1.0
 
           [Aiming]
           ; Key used to aim (right mouse by default). Change it if you remapped aiming in-game.
           AimKey=RBUTTON
-          ; When you press OR release the aim key, the world is allowed to run at
-          ; AimTransitionGameSpeed for this many seconds so the camera / aim transition
-          ; is never sluggish. Set to 0 to disable that and keep the world slowed.
-          AimTransitionTime=0.5
+          ; (The camera swing is handled by the [Camera] section above, without touching NPCs.)
+          ; OPTIONAL: when you press OR release the aim key the WHOLE WORLD is allowed to run at
+          ; AimTransitionGameSpeed for this many seconds, to un-slow the camera swing.
+          ; WARNING: NPCs run at that speed too, so they can draw/aim weapons almost instantly
+          ; during this window. 0 = off (recommended). Try 0.2-0.3 with a lower speed
+          ; (e.g. AimTransitionGameSpeed=0.5) if you want a compromise.
+          AimTransitionTime=0.0
           ; World speed during that window (1.0 = full normal speed)
           AimTransitionGameSpeed=1.0
           ; Seconds used to blend in/out of the aim behaviour
@@ -1047,6 +1218,9 @@ jobs:
           SkipVersionCheck=0
           ; Set to 1 if the mod never activates and the log shows a "menu/pause" problem
           IgnoreMenuFlag=0
+          ; Set to 0 to disable all call-site hooks (camera + CJ step hook) if they cause trouble.
+          ; Needs a game restart to take effect.
+          CallHooks=1
           HotReload=1
           ; Writes BulletTime.log next to the .asi
           Log=1
