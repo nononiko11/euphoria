@@ -63,10 +63,13 @@ jobs:
           static const DWORD F_CAM_PROCESS = 0x52B730;  // void __thiscall CCamera::Process()
           static const DWORD F_CCAM_PROCESS= 0x526FC0;  // void __thiscall CCam::Process()  (called from inside CCamera::Process)
           static const DWORD F_UPDATE_ANIMS= 0x4D34F0;  // void __cdecl RpAnimBlendClumpUpdateAnimations(RpClump*, float step, bool)
+          static const DWORD F_DRAW_CROSSHAIRS = 0x58E020; // void __cdecl CHud::DrawCrossHairs()
           static const DWORD A_THECAMERA   = 0xB6F028;  // CCamera TheCamera
           static const DWORD A_GAMEMS      = 0xB7CB84;  // uint CTimer::m_snTimeInMilliseconds
           static const int   PED_CLUMP     = 0x18;      // CEntity::m_pRwObject
           static const int   PED_HEALTH    = 0x540;     // CPed::m_fHealth
+          static const int   PED_VEHICLE   = 0x58C;     // CPed::m_pVehicle
+          static const int   PED_WEAPONSLOT= 0x718;     // CPed::m_nActiveWeaponSlot
           static const int   PLAYERINFO_SZ = 0x190;     // sizeof(CPlayerInfo)
 
           // ----------------------------------------------------------------------------
@@ -184,6 +187,20 @@ jobs:
               bool  cameraHook     = true;
               float cameraSpeed    = 1.0f;
               float aimCameraSpeed = 1.0f;
+              // [Crosshair]
+              bool  chEnabled      = true;
+              bool  chOnlyBT       = true;
+              float chX            = 0.53f;
+              float chY            = 0.40f;
+              float chSize         = 9.0f;
+              float chGap          = 5.0f;
+              float chThick        = 2.0f;
+              bool  chDot          = true;
+              bool  chOutline      = true;
+              float chColor[3]     = { 1.0f, 1.0f, 1.0f };
+              float chOpacity      = 0.95f;
+              bool  chChecks       = true;
+              bool  chHide         = true;
               // [Filter]
               bool  filterOn       = true;
               float filterIntensity = 1.0f;
@@ -342,6 +359,20 @@ jobs:
               c.cameraSpeed    = Clamp(ReadFloat("Camera", "CameraSpeed",    c.cameraSpeed),    0.01f, 10.f);
               c.aimCameraSpeed = Clamp(ReadFloat("Camera", "AimCameraSpeed", c.aimCameraSpeed), 0.01f, 10.f);
 
+              c.chEnabled = ReadBool("Crosshair", "Enabled", true);
+              c.chOnlyBT  = ReadBool("Crosshair", "OnlyInBulletTime", true);
+              c.chX       = Clamp(ReadFloat("Crosshair", "PosX",      c.chX),      0.f, 1.f);
+              c.chY       = Clamp(ReadFloat("Crosshair", "PosY",      c.chY),      0.f, 1.f);
+              c.chSize    = Clamp(ReadFloat("Crosshair", "Size",      c.chSize),   1.f, 200.f);
+              c.chGap     = Clamp(ReadFloat("Crosshair", "Gap",       c.chGap),    0.f, 200.f);
+              c.chThick   = Clamp(ReadFloat("Crosshair", "Thickness", c.chThick),  1.f, 50.f);
+              c.chDot     = ReadBool("Crosshair", "Dot", true);
+              c.chOutline = ReadBool("Crosshair", "Outline", true);
+              ReadColor("Crosshair", "Color", c.chColor);
+              c.chOpacity = Clamp(ReadFloat("Crosshair", "Opacity", c.chOpacity),  0.f, 1.f);
+              c.chChecks  = ReadBool("Crosshair", "Checks", true);
+              c.chHide    = ReadBool("Crosshair", "HideGameCrosshair", true);
+
               c.filterOn        = ReadBool("Filter", "Enabled", true);
               c.filterIntensity = Clamp(ReadFloat("Filter", "Intensity",    c.filterIntensity), 0.f, 1.f);
               c.saturation      = Clamp(ReadFloat("Filter", "Saturation",   c.saturation),      0.f, 3.f);
@@ -486,7 +517,17 @@ jobs:
           static float g_stepFactor = 1.f;     // time step multiplier for CJ's animation update
           static void* g_playerClump = NULL;
           static bool  g_camHookUsed = false, g_stepHookUsed = false;
-          static int   g_camHookCount = 0, g_ccamHookCount = 0, g_animHookCount = 0;
+          static int   g_camHookCount = 0, g_ccamHookCount = 0, g_animHookCount = 0, g_chHookCount = 0;
+          static bool  g_hideGameCH = false;   // true while our own crosshair is shown instead of the game's
+          static float g_crossA = 0.f;         // opacity of our own crosshair this frame (0 = not drawn)
+
+          typedef void(__cdecl* VoidFn_t)();
+          static VoidFn_t g_origDrawCH = (VoidFn_t)F_DRAW_CROSSHAIRS;
+          static void __cdecl hkDrawCrossHairs()
+          {
+              if (g_hideGameCH) return;
+              g_origDrawCH();
+          }
 
           static CamProcess_t g_origCCam = (CamProcess_t)F_CCAM_PROCESS;
           static int g_camDepth = 0;           // guards against scaling twice when the hooks are nested
@@ -586,6 +627,7 @@ jobs:
               if (!g_cfg.callHooks) { Log("call hooks disabled in the ini (CallHooks=0)"); return; }
               g_camHookCount  = HookCallSites(F_CAM_PROCESS,   (void*)hkCamProcess,  4,  "CCamera::Process");
               g_ccamHookCount = HookCallSites(F_CCAM_PROCESS,  (void*)hkCCamProcess, 8,  "CCam::Process");
+              g_chHookCount   = HookCallSites(F_DRAW_CROSSHAIRS, (void*)hkDrawCrossHairs, 4, "CHud::DrawCrossHairs");
               g_animHookCount = HookCallSites(F_UPDATE_ANIMS,  (void*)hkUpdateAnims, 12, "RpAnimBlendClumpUpdateAnimations");
           }
 
@@ -702,9 +744,29 @@ jobs:
               g_camFactor = 1.f; g_stepFactor = 1.f;
           }
 
+          // Decides whether our own instant crosshair is shown this frame (and the game's hidden).
+          static void UpdateCrosshair(BYTE* ped, bool aimDown)
+          {
+              const Config& c = g_cfg;
+              g_crossA = 0.f; g_hideGameCH = false;
+              if (!c.chEnabled || !aimDown || !ped) return;
+              if (c.chOnlyBT && !(g_state != ST_IDLE && g_a > 0.02f)) return;
+              const int slot = *(volatile BYTE*)(ped + PED_WEAPONSLOT);
+              if (c.chChecks)
+              {
+                  if (slot < 2 || slot > 5) return;                          // pistols, shotgun, SMGs, assault rifles
+                  if (*(volatile DWORD*)(ped + PED_VEHICLE) != 0) return;     // not while in / entering a vehicle
+              }
+              g_crossA = c.chOpacity;
+              g_hideGameCH = c.chHide && g_chHookCount > 0;
+              static bool logged = false;
+              if (!logged) { logged = true; Log("instant crosshair shown (weapon slot %d, game crosshair %s)", slot, g_hideGameCH ? "hidden" : "left visible - CHud::DrawCrossHairs hook missing"); }
+          }
+
           static void FrameLogic()
           {
               g_suppress = false;
+              g_crossA = 0.f; g_hideGameCH = false;
               const double now = NowSec();
               double dt = now - g_lastNow;
               g_lastNow = now;
@@ -788,6 +850,8 @@ jobs:
                   }
                   break;
               }
+
+              UpdateCrosshair(ped, aimDown);
 
               if (g_state == ST_IDLE) { g_filterA = 0.f; return; }
 
@@ -952,14 +1016,80 @@ jobs:
               dev->SetVertexShader(NULL);
           }
 
-          static void DrawFilter(IDirect3DDevice9* dev, float a)
+          static void SetFlatStates(IDirect3DDevice9* dev)
+          {
+              dev->SetPixelShader(NULL);
+              dev->SetTexture(0, NULL);
+              dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
+              dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
+              dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
+              dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
+              dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
+              dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
+              dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
+              dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
+              dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
+              dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
+              dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+          }
+
+          static void PushRect(VertDiff* v, int& n, float x0, float y0, float x1, float y1, DWORD col)
+          {
+              const VertDiff a = { x0, y0, 0.f, 1.f, col }, b = { x1, y0, 0.f, 1.f, col };
+              const VertDiff c = { x0, y1, 0.f, 1.f, col }, d = { x1, y1, 0.f, 1.f, col };
+              v[n++] = a; v[n++] = b; v[n++] = c;
+              v[n++] = b; v[n++] = d; v[n++] = c;
+          }
+
+          // Builds the crosshair as a triangle list (4 arms + optional centre dot, with optional outline).
+          // Sizes are given for a 1080p screen and scale with the screen height. Returns the vertex count.
+          static int BuildCrosshair(VertDiff* v, float W, float H, float opacity)
+          {
+              const Config& c = g_cfg;
+              const float sc = H / 1080.f;
+              const float cx = floorf(c.chX * W + 0.5f), cy = floorf(c.chY * H + 0.5f);
+              float th  = floorf(c.chThick * sc + 0.5f); if (th  < 1.f) th  = 1.f;
+              float gap = floorf(c.chGap   * sc + 0.5f); if (gap < 0.f) gap = 0.f;
+              float len = floorf(c.chSize  * sc + 0.5f); if (len < 1.f) len = 1.f;
+              float og  = floorf(sc + 0.5f);             if (og  < 1.f) og  = 1.f;
+              const float ht = th * 0.5f;
+              const int a8 = (int)(Clamp(opacity, 0.f, 1.f) * 255.f + 0.5f);
+              const DWORD col  = D3DCOLOR_ARGB(a8, (int)(c.chColor[0] * 255.f + 0.5f), (int)(c.chColor[1] * 255.f + 0.5f), (int)(c.chColor[2] * 255.f + 0.5f));
+              const DWORD ocol = D3DCOLOR_ARGB((int)(a8 * 0.85f), 0, 0, 0);
+
+              int n = 0;
+              for (int pass = c.chOutline ? 0 : 1; pass < 2; ++pass)
+              {
+                  const float g = pass == 0 ? og : 0.f;
+                  const DWORD cl = pass == 0 ? ocol : col;
+                  PushRect(v, n, cx - gap - len - g, cy - ht - g, cx - gap + g,       cy + ht + g, cl);   // left
+                  PushRect(v, n, cx + gap - g,       cy - ht - g, cx + gap + len + g, cy + ht + g, cl);   // right
+                  PushRect(v, n, cx - ht - g, cy - gap - len - g, cx + ht + g, cy - gap + g,       cl);   // up
+                  PushRect(v, n, cx - ht - g, cy + gap - g,       cx + ht + g, cy + gap + len + g, cl);   // down
+                  if (c.chDot) PushRect(v, n, cx - ht - g, cy - ht - g, cx + ht + g, cy + ht + g, cl);
+              }
+              return n;
+          }
+
+          static void DrawCrosshair(IDirect3DDevice9* dev, float W, float H, float opacity)
+          {
+              VertDiff v[64];
+              const int n = BuildCrosshair(v, W, H, opacity);
+              if (n < 3) return;
+              SetFlatStates(dev);
+              dev->DrawPrimitiveUP(D3DPT_TRIANGLELIST, n / 3, v, sizeof(VertDiff));
+          }
+
+          // Draws the screen filter (if a > 0) and our own crosshair (if crossA > 0) right before Present.
+          static void DrawOverlays(IDirect3DDevice9* dev, float a, float crossA)
           {
               if (FAILED(dev->TestCooperativeLevel())) return;
 
               IDirect3DSurface9* bb = NULL;
               if (FAILED(dev->GetBackBuffer(0, 0, D3DBACKBUFFER_TYPE_MONO, &bb)) || !bb) return;
               D3DSURFACE_DESC d; bb->GetDesc(&d);
-              const bool useShader = EnsureGfx(dev, d);
+              const bool doFilter = a > 0.003f;
+              const bool useShader = doFilter && EnsureGfx(dev, d);
 
               IDirect3DSurface9* oldRT = NULL;
               dev->GetRenderTarget(0, &oldRT);
@@ -976,7 +1106,7 @@ jobs:
 
                       const Config& c = g_cfg;
                       const float w = (float)d.Width, h = (float)d.Height;
-                      bool done = false;
+                      bool done = !doFilter;
 
                       if (useShader && SUCCEEDED(dev->StretchRect(bb, NULL, g_texSurf, NULL, D3DTEXF_NONE)))
                       {
@@ -1018,19 +1148,7 @@ jobs:
                           // simple fallback: flat translucent tint
                           const float al = Clamp(a * (c.tintStrength + 0.25f * c.vigStrength), 0.f, 0.85f);
                           const DWORD col = D3DCOLOR_ARGB((int)(al * 255.f), (int)(c.tint[0] * 255.f), (int)(c.tint[1] * 255.f), (int)(c.tint[2] * 255.f));
-                          dev->SetPixelShader(NULL);
-                          dev->SetTexture(0, NULL);
-                          dev->SetRenderState(D3DRS_ALPHABLENDENABLE, TRUE);
-                          dev->SetRenderState(D3DRS_SRCBLEND, D3DBLEND_SRCALPHA);
-                          dev->SetRenderState(D3DRS_DESTBLEND, D3DBLEND_INVSRCALPHA);
-                          dev->SetRenderState(D3DRS_BLENDOP, D3DBLENDOP_ADD);
-                          dev->SetTextureStageState(0, D3DTSS_COLOROP, D3DTOP_SELECTARG1);
-                          dev->SetTextureStageState(0, D3DTSS_COLORARG1, D3DTA_DIFFUSE);
-                          dev->SetTextureStageState(0, D3DTSS_ALPHAOP, D3DTOP_SELECTARG1);
-                          dev->SetTextureStageState(0, D3DTSS_ALPHAARG1, D3DTA_DIFFUSE);
-                          dev->SetTextureStageState(1, D3DTSS_COLOROP, D3DTOP_DISABLE);
-                          dev->SetTextureStageState(1, D3DTSS_ALPHAOP, D3DTOP_DISABLE);
-                          dev->SetFVF(D3DFVF_XYZRHW | D3DFVF_DIFFUSE);
+                          SetFlatStates(dev);
                           const VertDiff q[4] = {
                               { -0.5f,  -0.5f,  0.f, 1.f, col },
                               { w - 0.5f, -0.5f,  0.f, 1.f, col },
@@ -1039,6 +1157,7 @@ jobs:
                           };
                           dev->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, q, sizeof(VertDiff));
                       }
+                      if (crossA > 0.003f) DrawCrosshair(dev, w, h, crossA);
                       dev->EndScene();
                   }
                   sb->Apply();
@@ -1078,7 +1197,9 @@ jobs:
               {
                   if (!g_hooksTried) { g_hooksTried = true; InstallCallHooks(); }
                   FrameLogic();
-                  if (g_filterA > 0.003f && g_cfg.filterOn && !g_suppress) DrawFilter(dev, g_filterA);
+                  const float fa = (g_cfg.filterOn && !g_suppress) ? g_filterA : 0.f;
+                  const float ca = g_suppress ? 0.f : g_crossA;
+                  if (fa > 0.003f || ca > 0.003f) DrawOverlays(dev, fa, ca);
               }
               __except (EXCEPTION_EXECUTE_HANDLER)
               {
@@ -1263,6 +1384,32 @@ jobs:
           AimEaseTime=0.12
           ; CJ's speed relative to normal while the aim key is held (1.0 = full speed)
           AimPlayerSpeed=1.0
+
+          [Crosshair]
+          ; Instant crosshair. The game only shows its own crosshair after the aim transition has
+          ; finished, and that takes much longer in slow motion. With this on, while you aim in
+          ; bullet time this mod draws a crosshair IMMEDIATELY and hides the game's delayed one.
+          ; (It is a simple drawn crosshair, not the game's own sprite; everything is configurable.)
+          Enabled=1
+          ; 1 = only while bullet time is active, 0 = also use it when bullet time is off
+          OnlyInBulletTime=1
+          ; Position as a fraction of the screen. The game's third-person aim point is 0.53 / 0.40.
+          PosX=0.53
+          PosY=0.40
+          ; Sizes are in pixels for a 1080p screen and scale with your resolution
+          Size=9
+          Gap=5
+          Thickness=2
+          ; Centre dot and a thin black outline (easier to see on bright backgrounds)
+          Dot=1
+          Outline=1
+          Color=255,255,255
+          Opacity=0.95
+          ; 1 = only for pistols / shotguns / SMGs / assault rifles and never in vehicles (recommended).
+          ; Set to 0 if the crosshair never shows for a weapon you want it for.
+          Checks=1
+          ; 1 = hide the game's own (delayed) crosshair while this one is shown
+          HideGameCrosshair=1
 
           [Filter]
           Enabled=1
