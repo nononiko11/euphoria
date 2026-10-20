@@ -61,7 +61,10 @@ jobs:
           static const DWORD A_TIMESTEP    = 0xB7CB5C;  // float CTimer::ms_fTimeStep
           static const DWORD A_TIMESTEP_NC = 0xB7CB58;  // float CTimer::ms_fTimeStepNonClipped
           static const DWORD F_CAM_PROCESS = 0x52B730;  // void __thiscall CCamera::Process()
+          static const DWORD F_CCAM_PROCESS= 0x526FC0;  // void __thiscall CCam::Process()  (called from inside CCamera::Process)
           static const DWORD F_UPDATE_ANIMS= 0x4D34F0;  // void __cdecl RpAnimBlendClumpUpdateAnimations(RpClump*, float step, bool)
+          static const DWORD A_THECAMERA   = 0xB6F028;  // CCamera TheCamera
+          static const DWORD A_GAMEMS      = 0xB7CB84;  // uint CTimer::m_snTimeInMilliseconds
           static const int   PED_CLUMP     = 0x18;      // CEntity::m_pRwObject
           static const int   PED_HEALTH    = 0x540;     // CPed::m_fHealth
           static const int   PLAYERINFO_SZ = 0x190;     // sizeof(CPlayerInfo)
@@ -197,6 +200,7 @@ jobs:
               bool  skipVersionCheck = false;
               bool  ignoreMenuFlag   = false;
               bool  callHooks        = true;
+              bool  cameraProbe      = false;
               bool  hotReload        = true;
               bool  logging          = true;
           };
@@ -353,6 +357,7 @@ jobs:
               c.skipVersionCheck = ReadBool("Advanced", "SkipVersionCheck", false);
               c.ignoreMenuFlag   = ReadBool("Advanced", "IgnoreMenuFlag",   false);
               c.callHooks        = ReadBool("Advanced", "CallHooks",        true);
+              c.cameraProbe      = ReadBool("Advanced", "CameraProbe",      false);
               c.hotReload        = ReadBool("Advanced", "HotReload",        true);
               c.logging          = ReadBool("Advanced", "Log",              true);
               g_logEnabled = c.logging;
@@ -481,26 +486,33 @@ jobs:
           static float g_stepFactor = 1.f;     // time step multiplier for CJ's animation update
           static void* g_playerClump = NULL;
           static bool  g_camHookUsed = false, g_stepHookUsed = false;
-          static int   g_camHookCount = 0, g_animHookCount = 0;
+          static int   g_camHookCount = 0, g_ccamHookCount = 0, g_animHookCount = 0;
 
-          static void __fastcall hkCamProcess(void* self, void* /*edx*/)
+          static CamProcess_t g_origCCam = (CamProcess_t)F_CCAM_PROCESS;
+          static int g_camDepth = 0;           // guards against scaling twice when the hooks are nested
+
+          static void CameraWrapped(void* self, CamProcess_t orig)
           {
               const float f = g_camFactor;
-              if (f != 1.f)
+              if (g_camDepth > 0 || f == 1.f)
               {
-                  volatile float* pStep = (volatile float*)A_TIMESTEP;
-                  volatile float* pRaw  = (volatile float*)A_TIMESTEP_NC;
-                  const float s = *pStep, r = *pRaw;
-                  float ns = s * f;
-                  const float cap = s > 3.f ? s : 3.f;   // the game never uses a step above 3
-                  if (ns > cap) ns = cap;
-                  *pStep = ns; *pRaw = r * f;
-                  g_camHookUsed = true;
-                  g_origCam(self);
-                  *pStep = s; *pRaw = r;
+                  ++g_camDepth; orig(self); --g_camDepth;
+                  return;
               }
-              else g_origCam(self);
+              volatile float* pStep = (volatile float*)A_TIMESTEP;
+              volatile float* pRaw  = (volatile float*)A_TIMESTEP_NC;
+              const float s = *pStep, r = *pRaw;
+              float ns = s * f;
+              const float cap = s > 3.f ? s : 3.f;   // the game never uses a step above 3
+              if (ns > cap) ns = cap;
+              *pStep = ns; *pRaw = r * f;
+              g_camHookUsed = true;
+              ++g_camDepth; orig(self); --g_camDepth;
+              *pStep = s; *pRaw = r;
           }
+
+          static void __fastcall hkCamProcess(void* self, void* /*edx*/)  { CameraWrapped(self, g_origCam); }
+          static void __fastcall hkCCamProcess(void* self, void* /*edx*/) { CameraWrapped(self, g_origCCam); }
 
           static void __cdecl hkUpdateAnims(void* clump, float step, DWORD onScreen)
           {
@@ -573,7 +585,59 @@ jobs:
           {
               if (!g_cfg.callHooks) { Log("call hooks disabled in the ini (CallHooks=0)"); return; }
               g_camHookCount  = HookCallSites(F_CAM_PROCESS,   (void*)hkCamProcess,  4,  "CCamera::Process");
+              g_ccamHookCount = HookCallSites(F_CCAM_PROCESS,  (void*)hkCCamProcess, 8,  "CCam::Process");
               g_animHookCount = HookCallSites(F_UPDATE_ANIMS,  (void*)hkUpdateAnims, 12, "RpAnimBlendClumpUpdateAnimations");
+          }
+
+          // ----------------------------------------------------------------------------
+          //  Camera probe (diagnostic, [Advanced] CameraProbe=1)
+          //
+          //  After the aim key is pressed or released it logs which small integer values inside
+          //  TheCamera change (state flags, game-clock timestamps, durations). This is used to
+          //  find the camera's transition fields without guessing structure offsets.
+          // ----------------------------------------------------------------------------
+          enum { PROBE_SIZE = 0xD80 };
+          static BYTE g_probePrev[PROBE_SIZE];
+          static BYTE g_probeSeen[PROBE_SIZE / 4];
+          static bool g_probeHave = false;
+          static int  g_probeFrames = 0, g_probeLogged = 0, g_probeEdge = 0;
+
+          static void ProbeCamera(int edge)   // edge: 0 none, 1 aim pressed, 2 aim released
+          {
+              __try
+              {
+                  BYTE cur[PROBE_SIZE];
+                  memcpy(cur, (const void*)A_THECAMERA, PROBE_SIZE);
+                  const DWORD gameMs = *(volatile DWORD*)A_GAMEMS;
+                  if (edge)
+                  {
+                      ++g_probeEdge;
+                      g_probeFrames = 240; g_probeLogged = 0;
+                      memset(g_probeSeen, 0, sizeof(g_probeSeen));
+                      Log("probe #%d: aim %s, gameMs=%u, timescale=%.3f", g_probeEdge, edge == 1 ? "PRESSED" : "RELEASED",
+                          (unsigned)gameMs, *(volatile float*)A_TIMESCALE);
+                  }
+                  if (g_probeHave && g_probeFrames > 0)
+                  {
+                      for (int o = 0; o < PROBE_SIZE; o += 4)
+                      {
+                          const DWORD a = *(const DWORD*)(g_probePrev + o), b = *(const DWORD*)(cur + o);
+                          if (a == b || g_probeSeen[o / 4] || g_probeLogged >= 250) continue;
+                          if (a >= 0x20000000u || b >= 0x20000000u) continue;     // skip floats / pointers
+                          g_probeSeen[o / 4] = 1; ++g_probeLogged;
+                          Log("probe #%d +%03d: TheCamera+0x%03X  %u -> %u   (gameMs=%u)", g_probeEdge, 240 - g_probeFrames, o,
+                              (unsigned)a, (unsigned)b, (unsigned)gameMs);
+                      }
+                  }
+                  memcpy(g_probePrev, cur, PROBE_SIZE);
+                  g_probeHave = true;
+                  if (g_probeFrames > 0) --g_probeFrames;
+              }
+              __except (EXCEPTION_EXECUTE_HANDLER)
+              {
+                  g_probeFrames = 0; g_probeHave = false;
+                  Log("probe: could not read TheCamera (wrong game version?)");
+              }
           }
 
           // ----------------------------------------------------------------------------
@@ -667,11 +731,14 @@ jobs:
 
               const bool pressed = keyDown && !g_prevKey;
               g_prevKey = keyDown;
+              int aimEdge = 0;
               if (aimDown != g_prevAim)
               {
                   g_prevAim = aimDown;
+                  aimEdge = aimDown ? 1 : 2;
                   if (c.aimTransTime > 0.f) g_aimWindowEnd = now + c.aimTransTime;
               }
+              if (c.cameraProbe) ProbeCamera(aimEdge);
 
               BYTE*  ped    = GetPlayerPed();
               float  health = ped ? *(volatile float*)(ped + PED_HEALTH) : 0.f;
@@ -745,8 +812,9 @@ jobs:
               float f = c.playerComp ? ps / eff : 1.f;
               f = Clamp(f, 0.05f, 30.f);
 
-              // Auto = patch the animation speeds, and fall back to the step hook if that layout check fails
-              const bool useStep = (c.playerMethod == 2) || (c.playerMethod == 0 && g_animBad && g_animHookCount > 0);
+              // Auto = scale CJ's animation time step through the hook (this also speeds up animation blends,
+              // which is what makes the aim transition fast); falls back to rewriting animation speeds
+              const bool useStep = (c.playerMethod == 2) || (c.playerMethod == 0 && g_animHookCount > 0);
               g_playerClump = *(void* volatile*)(ped + PED_CLUMP);
               if (useStep) { g_stepFactor = f; if (g_nTrk) ApplyAnimFactor(ped, 1.f); }
               else         { g_stepFactor = 1.f; if (c.playerMethod != 2) ApplyAnimFactor(ped, f); }
@@ -755,7 +823,7 @@ jobs:
               const float csBase = Lerp(1.f, c.cameraSpeed, a);
               const float csAim  = Lerp(1.f, c.aimCameraSpeed, a);
               const float cs     = Lerp(csBase, csAim, Smooth01(g_aimLevel));
-              g_camFactor = (c.cameraHook && g_camHookCount > 0) ? Clamp(cs / eff, 0.05f, 30.f) : 1.f;
+              g_camFactor = (c.cameraHook && (g_camHookCount + g_ccamHookCount) > 0) ? Clamp(cs / eff, 0.05f, 30.f) : 1.f;
 
               static bool loggedCam = false, loggedStep = false;
               if (g_camHookUsed && !loggedCam)   { loggedCam = true;  Log("camera hook is active (camera time step compensated, factor %.2f)", g_camFactor); }
@@ -1160,15 +1228,18 @@ jobs:
           ; 0 = don't touch CJ's animations at all (CJ is slowed like the rest of the world)
           PlayerCompensation=1
           ; How CJ's speed is applied:
-          ;   Auto  = rewrite his animation speeds; if that layout check fails, use the step hook
-          ;   Speed = always rewrite animation speeds
-          ;   Step  = always scale his animation time step through the call hook
-          ; If CJ is NOT keeping his speed in bullet time, try Step (see BulletTime.log).
+          ;   Auto  = scale CJ's animation time step through the game hook (best: it also speeds up
+          ;           animation blends, so CJ raises his gun at full speed); if the hook could not be
+          ;           installed it falls back to rewriting animation speeds
+          ;   Step  = always use the hook
+          ;   Speed = always rewrite animation speeds (old method)
           PlayerMethod=Auto
 
           [Camera]
-          ; The camera update is run with a compensated time step so the camera (and the aim
-          ; swing) is NOT slowed down while NPCs and the world stay slow.
+          ; The camera update is run with a compensated time step so camera smoothing is NOT
+          ; slowed down while NPCs and the world stay slow.
+          ; NOTE: the camera's mode transitions (e.g. the swing into aim mode) are timed by the game
+          ; clock, which this cannot speed up on its own. See CameraProbe under [Advanced].
           Enabled=1
           ; Camera speed relative to NORMAL during bullet time (1.0 = camera never slowed,
           ; same as GameSpeed = camera slowed like the world)
@@ -1221,6 +1292,11 @@ jobs:
           ; Set to 0 to disable all call-site hooks (camera + CJ step hook) if they cause trouble.
           ; Needs a game restart to take effect.
           CallHooks=1
+          ; Diagnostic. With 1, every time the aim key is pressed or released the log records which
+          ; camera values change (state flags, game-clock timestamps, durations).
+          ; To use it: set 1, start the game, aim once and release (bullet time OFF), aim once and
+          ; release (bullet time ON), then send BulletTime.log. Set back to 0 afterwards.
+          CameraProbe=0
           HotReload=1
           ; Writes BulletTime.log next to the .asi
           Log=1
